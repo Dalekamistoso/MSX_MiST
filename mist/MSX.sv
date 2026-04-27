@@ -348,15 +348,37 @@ wire       msx_ps2_kbd_data = (ps2_kbd_data == 1'b0 ? ps2_kbd_data : 1'bZ);
 reg  [7:0] dipsw;
 wire [7:0] leds;
 
-reg reset;
-reg  [27:0] img_reset_cnt = 0;
-wire resetW = status[0] | buttons[1] | img_reset_cnt != 0;
+// 26-bit counter – 2^26 / 21.48 MHz ≈ 3.1 s
+reg  [25:0] pw_cnt = 26'h3FFFFFF;   // loaded by PLL guard; MSX held in reset
+
+// 21-bit settle for OSD / button reset – 2^21 / 21.48 MHz ≈ 98 ms
+reg  [20:0] settle = 21'd0;
+
+reg reset = 1'b1;
+
+wire resetW = ~locked | (pw_cnt != 26'd0) | (settle != 21'd0);
 
 always @(posedge clk_sys) begin
-	if (img_reset_cnt != 0) img_reset_cnt <= img_reset_cnt - 1'd1;
-	if (img_mounted) img_reset_cnt <= 28'h2000000;
-	reset <= resetW;
-	dipsw <= {1'b0, ~status[6], ~status[5:4], ~status[3], ~scandoubler_disable & status[8], scandoubler_disable, ~status[2]};
+    // ── PLL guard ─────────────────────────────────────────────────
+    if (~locked) begin
+        pw_cnt <= 26'h3FFFFFF;   // restart 3.1 s on every PLL glitch
+        settle <= 21'd0;
+    end else begin
+        if (pw_cnt != 26'd0) pw_cnt <= pw_cnt - 26'd1;
+        if (settle != 21'd0) settle <= settle - 21'd1;
+    end
+
+    // ── OSD / physical reset ──────────────────────────────────────
+    // pw_cnt is NOT reloaded here: HDMI is already configured.
+    if (status[0] | buttons[1])
+        settle <= 21'h1FFFFF;
+
+    // img_mounted: handled entirely by sd_card.v (vhd/vhd_size update).
+    // No reset action taken here – all versions that tried to trigger a
+    // reset on img_mounted suffered from the ARM's repeated notifications.
+
+    reset <= resetW;
+    dipsw <= {1'b0, ~status[6], ~status[5:4], ~status[3], ~scandoubler_disable & status[8], scandoubler_disable, ~status[2]};
 end
 
 always_comb begin
@@ -594,7 +616,9 @@ end
 
 `ifdef I2S_AUDIO
 i2s i2s (
-	.reset(1'b0),
+	// Drive I2S reset from the system reset so the module always starts from a
+	// known state after PLL lock and is re-initialised on every system reset.
+	.reset(reset),
 	.clk(clk_sys),
 	.clk_rate(32'd21_480_000),
 	.sclk(I2S_BCK),
